@@ -680,7 +680,7 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 		return err
 	}
 
-	// Удаляем файлы
+	// Обработка файлов для удаления
 	rows, err := db.Query("SELECT fname FROM curfiles WHERE fflag = 1")
 	if err != nil {
 		return err
@@ -694,11 +694,18 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 			continue
 		}
 
-		if err := os.Remove(fname); err != nil {
-			logPrintf("Ошибка удаления файла %s: %v\n", fname, err)
-		} else {
+		if testMode {
+			// В режиме тестирования только логируем, не удаляем
+			logPrintf("Файл будет удален: %s\n", fname)
 			removedCount++
-			logPrintf("Файл удален: %s\n", fname)
+		} else {
+			// В обычном режиме удаляем файл
+			if err := os.Remove(fname); err != nil {
+				logPrintf("Ошибка удаления файла %s: %v\n", fname, err)
+			} else {
+				removedCount++
+				logPrintf("Файл удален: %s\n", fname)
+			}
 		}
 	}
 
