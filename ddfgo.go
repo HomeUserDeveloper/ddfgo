@@ -695,9 +695,8 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 		}
 
 		if testMode {
-			// В режиме тестирования только логируем, не удаляем
+			// В режиме тестирования только логируем, не удаляем и не считаем
 			logPrintf("Файл будет удален: %s\n", fname)
-			removedCount++
 		} else {
 			// В обычном режиме удаляем файл
 			if err := os.Remove(fname); err != nil {
