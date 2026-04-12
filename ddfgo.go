@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,7 +49,7 @@ var expandToSkip = map[string]bool{
 }
 
 // Version встраивается при компиляции через ldflags
-var Version = "000.000.000.006"
+var Version = "000.000.000.007"
 
 var (
 	filesProcessed  int
@@ -244,7 +245,7 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("  • SQLite базу данных для быстрого поиска")
 	fmt.Println("  • MD5 хеширование для надежного определения дубликатов")
-	fmt.Println("  • Параллельную обработку (до 10 одновременных потоков)")
+	fmt.Println("  • Параллельную обработку (адаптируется к количеству CPU: NumCPU() * 2 горутин)")
 	fmt.Println("  • Механизм блокировки для предотвращения одновременных запусков")
 	fmt.Println()
 	fmt.Println("ИСКЛЮЧАЕМЫЕ РАСШИРЕНИЯ (по умолчанию):")
@@ -554,7 +555,9 @@ func calculateMD5Hashes(db *sql.DB) error {
 	var wg sync.WaitGroup
 
 	// Ограничиваем количество параллельных вычислений
-	semaphore := make(chan struct{}, 10) // максимум 10 горутин
+	// Используем NumCPU() * 2 для I/O операций (MD5 + чтение файла)
+	numWorkers := runtime.NumCPU() * 2
+	semaphore := make(chan struct{}, numWorkers)
 
 	// Собираем файлы для обработки
 	var files []struct {
