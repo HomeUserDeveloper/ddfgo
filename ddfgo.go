@@ -37,22 +37,12 @@ import (
 
 const (
 	lockFileName = "ddfgo.lock"
-	mutexTimeout = 5 * time.Second
 )
 
 // Version встраивается при компиляции через ldflags
 var Version = "000.000.000.001"
 
-type FileInfo struct {
-	Fnum  int64
-	Fname string
-	Fsize int64
-	Md5   string
-	Fflag bool
-}
-
 var (
-	mu              sync.Mutex
 	filesProcessed  int
 	filesRemoved    int
 	duplicatesFound int
@@ -63,7 +53,6 @@ var (
 	removeAllFiles  bool // флаг -all для удаления всех дубликатов, включая маленькие файлы
 	removeEmptyDirs bool // флаг -dir0 для удаления пустых каталогов
 	logOutput       *os.File
-	errLogOutput    *os.File
 )
 
 func main() {
