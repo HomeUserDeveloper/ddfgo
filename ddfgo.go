@@ -39,19 +39,29 @@ const (
 	lockFileName = "ddfgo.lock"
 )
 
+// expandToSkip - расширения файлов которые исключаются по умолчанию
+// (проблемные файлы для обычных пользователей - Windows Defender блокирует доступ)
+var expandToSkip = map[string]bool{
+	".exe": true,
+	".dll": true,
+	".lib": true,
+}
+
 // Version встраивается при компиляции через ldflags
-var Version = "000.000.000.001"
+var Version = "000.000.000.006"
 
 var (
 	filesProcessed  int
 	filesRemoved    int
 	duplicatesFound int
+	filesSkipped    int    // количество пропущенных файлов (исключенные расширения)
 	logFile         string = "ddfgo.log"
 	errLogFile      string = "ddfgoerr.log"
 	testMode        bool
 	cleanMode       bool
 	removeAllFiles  bool // флаг -all для удаления всех дубликатов, включая маленькие файлы
 	removeEmptyDirs bool // флаг -dir0 для удаления пустых каталогов
+	extensionAll    bool // флаг -ext-all для обработки файлов со всеми расширениями
 	logOutput       *os.File
 )
 
@@ -69,6 +79,7 @@ func main() {
 	flag.BoolVar(&cleanMode, "clean", false, "Очистить лог файл перед запуском")
 	flag.BoolVar(&removeAllFiles, "all", false, "Удалять дубликаты всех размеров, включая файлы < 10KB")
 	flag.BoolVar(&removeEmptyDirs, "dir0", false, "Удалить пустые каталоги после завершения")
+	flag.BoolVar(&extensionAll, "ext-all", false, "Обрабатывать файлы со всеми расширениями (включая .exe, .dll, .lib)")
 	flag.BoolVar(&showHelp, "help", false, "Показать справку")
 	flag.BoolVar(&showHelp, "h", false, "Показать справку (сокращенно)")
 	flag.BoolVar(&showVersion, "version", false, "Показать номер версии")
@@ -176,6 +187,12 @@ func printHelp() {
 	fmt.Println("    Рекурсивно обходит все подпапки и удаляет пустые директории")
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Files\" -dir0")
 	fmt.Println()
+	fmt.Println("  -ext-all")
+	fmt.Println("    Обрабатывать файлы со всеми расширениями")
+	fmt.Println("    По умолчанию исключаются: .exe, .dll, .lib")
+	fmt.Println("    (эти файлы могут быть заблокированы Windows Defender при обычных правах)")
+	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -ext-all")
+	fmt.Println()
 	fmt.Println("ИНФОРМАЦИОННЫЕ ПАРАМЕТРЫ:")
 	fmt.Println()
 	fmt.Println("  -help, -h")
@@ -210,8 +227,11 @@ func printHelp() {
 	fmt.Println("  6. Удаление дубликатов с очисткой пустых каталогов:")
 	fmt.Println("     ddfgo -dir \"D:\\Files\" -dir0")
 	fmt.Println()
+	fmt.Println("  7. Обработка файлов со всеми расширениями:")
+	fmt.Println("     ddfgo -dir \"D:\\Data\" -ext-all")
+	fmt.Println()
 	fmt.Println("  7. Комбинированное использование всех флагов:")
-	fmt.Println("     ddfgo -dir \"D:\\Data\" -all -dir0 -test -clean")
+	fmt.Println("     ddfgo -dir \"D:\\Data\" -all -dir0 -ext-all -test -clean")
 	fmt.Println()
 	fmt.Println("  8. Используя переменную окружения:")
 	fmt.Println("     set DDF_DIR=D:\\MyFiles")
@@ -226,6 +246,16 @@ func printHelp() {
 	fmt.Println("  • MD5 хеширование для надежного определения дубликатов")
 	fmt.Println("  • Параллельную обработку (до 10 одновременных потоков)")
 	fmt.Println("  • Механизм блокировки для предотвращения одновременных запусков")
+	fmt.Println()
+	fmt.Println("ИСКЛЮЧАЕМЫЕ РАСШИРЕНИЯ (по умолчанию):")
+	fmt.Println()
+	fmt.Println("  .exe - Исполняемые файлы")
+	fmt.Println("  .dll - Динамические библиотеки")
+	fmt.Println("  .lib - Библиотеки ссылок")
+	fmt.Println()
+	fmt.Println("  Windows Defender может блокировать доступ к этим файлам")
+	fmt.Println("  при запуске под обычным пользователем.")
+	fmt.Println("  Используйте флаг -ext-all для обработки всех файлов.")
 	fmt.Println()
 	fmt.Println("ЛОГИРОВАНИЕ:")
 	fmt.Println()
@@ -353,6 +383,9 @@ func runApp(targetDir string, lockFile string) int {
 	// Вывод статистики
 	logPrintf("\n=== Статистика ===\n")
 	logPrintf("Файлов обработано: %d\n", filesProcessed)
+	if !extensionAll {
+		logPrintf("Файлов пропущено (исключенные расширения): %d\n", filesSkipped)
+	}
 	logPrintf("Найдено дубликатов: %d\n", duplicatesFound)
 	logPrintf("Файлов удалено: %d\n", filesRemoved)
 	logPrintf("Время работы: %v\n", elapsed)
@@ -432,6 +465,15 @@ func scanDirectory(root string, db *sql.DB) error {
 			return nil
 		}
 		if !info.IsDir() {
+			// Проверяем расширение файла
+			if !extensionAll {
+				ext := strings.ToLower(filepath.Ext(path))
+				if expandToSkip[ext] {
+					filesSkipped++
+					return nil // Пропускаем файл с исключаемым расширением
+				}
+			}
+
 			if _, err := stmt.Exec(path, info.Size()); err != nil {
 				fmt.Printf("Ошибка добавления файла %s: %v\n", path, err)
 			} else {
