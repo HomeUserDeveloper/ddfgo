@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,6 +60,8 @@ var (
 	errLogFile      string = "ddfgoerr.log"
 	testMode        bool
 	cleanMode       bool
+	removeAllFiles  bool // флаг -all для удаления всех дубликатов, включая маленькие файлы
+	removeEmptyDirs bool // флаг -dir0 для удаления пустых каталогов
 	logOutput       *os.File
 	errLogOutput    *os.File
 )
@@ -75,6 +78,8 @@ func main() {
 	flag.StringVar(&targetDir, "dir", targetDir, "Директория для сканирования на наличие дубликатов")
 	flag.BoolVar(&testMode, "test", false, "Записать результаты в лог файл")
 	flag.BoolVar(&cleanMode, "clean", false, "Очистить лог файл перед запуском")
+	flag.BoolVar(&removeAllFiles, "all", false, "Удалять дубликаты всех размеров, включая файлы < 10KB")
+	flag.BoolVar(&removeEmptyDirs, "dir0", false, "Удалить пустые каталоги после завершения")
 	flag.BoolVar(&showHelp, "help", false, "Показать справку")
 	flag.BoolVar(&showHelp, "h", false, "Показать справку (сокращенно)")
 	flag.BoolVar(&showVersion, "version", false, "Показать номер версии")
@@ -171,6 +176,17 @@ func printHelp() {
 	fmt.Println("    Удаляет ddfgo.log и ddfgoerr.log перед работой")
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Videos\" -test -clean")
 	fmt.Println()
+	fmt.Println("  -all")
+	fmt.Println("    Удалять дубликаты всех размеров, включая файлы < 10KB")
+	fmt.Println("    По умолчанию файлы меньше 10KB исключаются из удаления")
+	fmt.Println("    (это полезно при наличии генерируемых файлов в электронных книгах)")
+	fmt.Println("    Пример: ddfgo -dir \"D:\\Books\" -all")
+	fmt.Println()
+	fmt.Println("  -dir0")
+	fmt.Println("    Удалить пустые каталоги после завершения обработки")
+	fmt.Println("    Рекурсивно обходит все подпапки и удаляет пустые директории")
+	fmt.Println("    Пример: ddfgo -dir \"D:\\Files\" -dir0")
+	fmt.Println()
 	fmt.Println("ИНФОРМАЦИОННЫЕ ПАРАМЕТРЫ:")
 	fmt.Println()
 	fmt.Println("  -help, -h")
@@ -199,7 +215,16 @@ func printHelp() {
 	fmt.Println("     ddfgo -dir \"E:\\Photos\" -test -clean")
 	fmt.Println("     Затем посмотрите результаты: type ddfgo.log")
 	fmt.Println()
-	fmt.Println("  5. Используя переменную окружения:")
+	fmt.Println("  5. Удаление дубликатов всех размеров (включая маленькие файлы):")
+	fmt.Println("     ddfgo -dir \"D:\\Books\" -all")
+	fmt.Println()
+	fmt.Println("  6. Удаление дубликатов с очисткой пустых каталогов:")
+	fmt.Println("     ddfgo -dir \"D:\\Files\" -dir0")
+	fmt.Println()
+	fmt.Println("  7. Комбинированное использование всех флагов:")
+	fmt.Println("     ddfgo -dir \"D:\\Data\" -all -dir0 -test -clean")
+	fmt.Println()
+	fmt.Println("  8. Используя переменную окружения:")
 	fmt.Println("     set DDF_DIR=D:\\MyFiles")
 	fmt.Println("     ddfgo")
 	fmt.Println()
@@ -324,6 +349,13 @@ func runApp(targetDir string, lockFile string) int {
 		logError("Ошибка удаления дубликатов: %v", err)
 		logPrintf("Ошибка удаления дубликатов: %v\n", err)
 		return 1
+	}
+
+	// Шаг 6: Удаление пустых каталогов (если включен флаг -dir0)
+	if removeEmptyDirs {
+		logPrintf("\nУдаление пустых каталогов...\n")
+		removedDirs := removeEmptyDirectories(targetDir)
+		logPrintf("Удалено пустых каталогов: %d\n", removedDirs)
 	}
 
 	// Вычисляем прошедшее время
@@ -582,7 +614,7 @@ func calculateMD5Hashes(db *sql.DB) error {
 func findDuplicatesByMD5(db *sql.DB) error {
 	// Получаем дубликаты по MD5
 	rows, err := db.Query(`
-		SELECT fnum, fname, md5 FROM curfiles 
+		SELECT fnum, fname, fsize, md5 FROM curfiles 
 		WHERE md5 IS NOT NULL AND md5 IN (
 			SELECT md5 FROM curfiles 
 			WHERE md5 IS NOT NULL
@@ -599,6 +631,7 @@ func findDuplicatesByMD5(db *sql.DB) error {
 	type DuplicateFile struct {
 		fnum  int64
 		fname string
+		fsize int64
 		md5   string
 	}
 
@@ -606,12 +639,13 @@ func findDuplicatesByMD5(db *sql.DB) error {
 	for rows.Next() {
 		var fnum int64
 		var fname string
+		var fsize int64
 		var md5 string
-		if err := rows.Scan(&fnum, &fname, &md5); err != nil {
+		if err := rows.Scan(&fnum, &fname, &fsize, &md5); err != nil {
 			logPrintf("Ошибка при сканировании: %v\n", err)
 			continue
 		}
-		filesToKeep = append(filesToKeep, DuplicateFile{fnum, fname, md5})
+		filesToKeep = append(filesToKeep, DuplicateFile{fnum, fname, fsize, md5})
 	}
 
 	// Подсчитываем уникальные MD5
@@ -634,8 +668,8 @@ func findDuplicatesByMD5(db *sql.DB) error {
 	defer stmt.Close()
 
 	for _, file := range filesToKeep {
-		// fsize не используется, т.к. нам нужна только информация для удаления
-		_, err = stmt.Exec(file.fnum, file.fname, 0, file.md5)
+		// Передаём правильный размер файла
+		_, err = stmt.Exec(file.fnum, file.fname, file.fsize, file.md5)
 		if err != nil {
 			logPrintf("Ошибка добавления файла: %v\n", err)
 		}
@@ -645,7 +679,13 @@ func findDuplicatesByMD5(db *sql.DB) error {
 }
 
 // markAndRemoveDuplicates помечает и удаляет дубликаты, оставляя один файл из каждой группы
+// Исключает файлы меньше 10KB по умолчанию (если не установлен флаг -all)
 func markAndRemoveDuplicates(db *sql.DB) error {
+	minFileSize := int64(10240) // 10KB в байтах
+	if removeAllFiles {
+		minFileSize = 0 // Если флаг -all, то удаляем все, включая маленькие файлы
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -653,20 +693,20 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	defer tx.Rollback()
 
 	// Используем оконные функции для оптимизации
-	query := `
+	query := fmt.Sprintf(`
     UPDATE curfiles 
     SET fflag = 1 
     WHERE fnum IN (
         SELECT fnum 
         FROM (
-            SELECT fnum, 
+            SELECT fnum, fsize,
                    ROW_NUMBER() OVER (PARTITION BY md5 ORDER BY fname) as rn
             FROM curfiles 
             WHERE md5 IS NOT NULL
         ) ranked
-        WHERE ranked.rn > 1
+        WHERE ranked.rn > 1 AND ranked.fsize >= %d
     )
-    `
+    `, minFileSize)
 
 	result, err := tx.Exec(query)
 	if err != nil {
@@ -674,7 +714,13 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	}
 
 	affected, _ := result.RowsAffected()
-	logPrintf("Помечено для удаления: %d файлов\n", affected)
+
+	// Логируем информацию об исключенных файлах
+	if !removeAllFiles {
+		logPrintf("Помечено для удаления: %d файлов (файлы < 10KB исключены)\n", affected)
+	} else {
+		logPrintf("Помечено для удаления: %d файлов (все размеры, флаг -all)\n", affected)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return err
@@ -798,4 +844,55 @@ func releaseLock(lockFile string, lockHandle *os.File) error {
 		os.Remove(lockFile)
 	}
 	return nil
+}
+
+// removeEmptyDirectories рекурсивно удаляет пустые каталоги в указанной директории
+func removeEmptyDirectories(root string) int {
+	removedCount := 0
+
+	// Используем filepath.Walk для обхода всех файлов
+	// но нам нужно обходить снизу вверх (post-order), чтобы удалялись сначала глубокие пустые папки
+	// Поэтому сначала создаем список всех директорий
+	var dirs []string
+
+	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() && path != root {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+
+	// Сортируем директории так, чтобы более глубокие были в конце
+	// (это предпочтительный порядок для удаления - снизу вверх)
+	// В Go нет встроенной сортировки по глубине, но мы можем отсортировать по длине пути
+	// Директории с большей длиной пути будут удаляться первыми
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i]) > len(dirs[j]) // Обратный порядок (более глубокие первыми)
+	})
+
+	// Пытаемся удалить каждую директорию
+	for _, dir := range dirs {
+		// Проверяем, пуста ли директория
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // Пропускаем если не можем прочитать
+		}
+
+		if len(entries) == 0 {
+			// Директория пуста, пытаемся удалить
+			if err := os.Remove(dir); err == nil {
+				removedCount++
+				if testMode {
+					logPrintf("Пустой каталог будет удален: %s\n", dir)
+				} else {
+					logPrintf("Пустой каталог удален: %s\n", dir)
+				}
+			}
+		}
+	}
+
+	return removedCount
 }
