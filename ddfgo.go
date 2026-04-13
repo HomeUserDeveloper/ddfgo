@@ -19,7 +19,6 @@
 package main
 
 import (
-	"crypto/md5"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -33,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zeebo/xxh3"
 	_ "modernc.org/sqlite"
 )
 
@@ -49,7 +49,7 @@ var expandToSkip = map[string]bool{
 }
 
 // Version встраивается при компиляции через ldflags
-var Version = "000.000.000.007"
+var Version = "000.000.000.008"
 
 var (
 	filesProcessed  int
@@ -244,7 +244,7 @@ func printHelp() {
 	fmt.Println("  дубликатов файлов в больших каталогах. Использует:")
 	fmt.Println()
 	fmt.Println("  • SQLite базу данных для быстрого поиска")
-	fmt.Println("  • MD5 хеширование для надежного определения дубликатов")
+	fmt.Println("  • XXH3 хеширование для надежного определения дубликатов")
 	fmt.Println("  • Параллельную обработку (адаптируется к количеству CPU: NumCPU() * 2 горутин)")
 	fmt.Println("  • Механизм блокировки для предотвращения одновременных запусков")
 	fmt.Println()
@@ -350,17 +350,17 @@ func runApp(targetDir string, lockFile string) int {
 		return 1
 	}
 
-	// Шаг 3: Вычисление MD5 для потенциальных дубликатов
-	if err := calculateMD5Hashes(db); err != nil {
-		logError("Ошибка вычисления MD5 хешей: %v", err)
-		logPrintf("Ошибка вычисления MD5 хешей: %v\n", err)
+	// Шаг 3: Вычисление XXH3 хешей для потенциальных дубликатов
+	if err := calculateHashes(db); err != nil {
+		logError("Ошибка вычисления XXH3 хешей: %v", err)
+		logPrintf("Ошибка вычисления XXH3 хешей: %v\n", err)
 		return 1
 	}
 
-	// Шаг 4: Нахождение реальных дубликатов по MD5
-	if err := findDuplicatesByMD5(db); err != nil {
-		logError("Ошибка поиска дубликатов по MD5: %v", err)
-		logPrintf("Ошибка поиска дубликатов по MD5: %v\n", err)
+	// Шаг 4: Нахождение реальных дубликатов по XXH3
+	if err := findDuplicatesByHash(db); err != nil {
+		logError("Ошибка поиска дубликатов по XXH3: %v", err)
+		logPrintf("Ошибка поиска дубликатов по XXH3: %v\n", err)
 		return 1
 	}
 
@@ -420,7 +420,8 @@ func initDatabase(db *sql.DB) error {
         fnum INTEGER PRIMARY KEY,
         fname TEXT NOT NULL UNIQUE,
         fsize INTEGER NOT NULL,
-        md5 TEXT,
+        quick_hash TEXT,
+        full_hash TEXT,
         fflag INTEGER DEFAULT 0
     )`
 
@@ -431,7 +432,8 @@ func initDatabase(db *sql.DB) error {
 	// Создание индексов отдельно
 	indexes := []string{
 		"CREATE INDEX IF NOT EXISTS idx_fsize ON curfiles(fsize)",
-		"CREATE INDEX IF NOT EXISTS idx_md5 ON curfiles(md5)",
+		"CREATE INDEX IF NOT EXISTS idx_quick_hash ON curfiles(quick_hash)",
+		"CREATE INDEX IF NOT EXISTS idx_full_hash ON curfiles(full_hash)",
 		"CREATE INDEX IF NOT EXISTS idx_fflag ON curfiles(fflag)",
 	}
 
@@ -536,30 +538,155 @@ func findDuplicatesBySize(db *sql.DB) error {
 	return nil
 }
 
-// calculateMD5Hashes вычисляет MD5 для всех файлов в таблице
-// Параллельное вычисление MD5 с ограничением горутин
-func calculateMD5Hashes(db *sql.DB) error {
-	rows, err := db.Query("SELECT fnum, fname FROM curfiles WHERE md5 IS NULL")
+// calculateHashes вычисляет XXH3 хеши для всех файлов в таблице с оптимизацией
+// Сначала быстрый хеш (5% начала + 5% конца), затем полный хеш только для потенциальных дубликатов
+func calculateHashes(db *sql.DB) error {
+	// Шаг 1: Вычисляем быстрый хеш для всех файлов
+	if err := calculateQuickHashes(db); err != nil {
+		return err
+	}
+
+	// Шаг 2: Находим файлы с одинаковым быстрым хешем и вычисляем полный хеш
+	if err := calculateFullHashesForDuplicates(db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// calculateQuickHashes вычисляет быстрый хеш для всех файлов
+func calculateQuickHashes(db *sql.DB) error {
+	rows, err := db.Query("SELECT fnum, fname, fsize FROM curfiles WHERE quick_hash IS NULL")
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
-	type md5Result struct {
-		fnum int64
-		hash string
-		err  error
+	type hashResult struct {
+		fnum      int64
+		quickHash string
+		err       error
 	}
 
-	results := make(chan md5Result, 100)
+	results := make(chan hashResult, 100)
 	var wg sync.WaitGroup
 
-	// Ограничиваем количество параллельных вычислений
-	// Используем NumCPU() * 2 для I/O операций (MD5 + чтение файла)
 	numWorkers := runtime.NumCPU() * 2
 	semaphore := make(chan struct{}, numWorkers)
 
-	// Собираем файлы для обработки
+	var files []struct {
+		fnum  int64
+		fname string
+		fsize int64
+	}
+	for rows.Next() {
+		var fnum int64
+		var fname string
+		var fsize int64
+		if err := rows.Scan(&fnum, &fname, &fsize); err != nil {
+			continue
+		}
+		files = append(files, struct {
+			fnum  int64
+			fname string
+			fsize int64
+		}{fnum, fname, fsize})
+	}
+
+	for _, file := range files {
+		if !fileExists(file.fname) {
+			continue
+		}
+
+		wg.Add(1)
+		go func(fnum int64, fname string, fsize int64) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			quickHash, err := quickXXH3File(fname, fsize)
+			results <- hashResult{fnum: fnum, quickHash: quickHash, err: err}
+		}(file.fnum, file.fname, file.fsize)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("UPDATE curfiles SET quick_hash = ? WHERE fnum = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	batchCount := 0
+	for result := range results {
+		if result.err != nil {
+			fmt.Printf("Ошибка вычисления быстрого хеша: %v\n", result.err)
+			continue
+		}
+
+		if _, err := stmt.Exec(result.quickHash, result.fnum); err != nil {
+			fmt.Printf("Ошибка обновления быстрого хеша: %v\n", err)
+			continue
+		}
+
+		batchCount++
+		if batchCount >= 100 {
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			tx, err = db.Begin()
+			if err != nil {
+				return err
+			}
+			stmt, err = tx.Prepare("UPDATE curfiles SET quick_hash = ? WHERE fnum = ?")
+			if err != nil {
+				return err
+			}
+			batchCount = 0
+		}
+	}
+
+	return tx.Commit()
+}
+
+// calculateFullHashesForDuplicates вычисляет полный хеш только для файлов с одинаковым быстрым хешем
+func calculateFullHashesForDuplicates(db *sql.DB) error {
+	// Находим файлы, где quick_hash повторяется более одного раза
+	rows, err := db.Query(`
+		SELECT fnum, fname FROM curfiles 
+		WHERE quick_hash IS NOT NULL AND full_hash IS NULL AND quick_hash IN (
+			SELECT quick_hash FROM curfiles 
+			WHERE quick_hash IS NOT NULL
+			GROUP BY quick_hash 
+			HAVING COUNT(*) > 1
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type hashResult struct {
+		fnum     int64
+		fullHash string
+		err      error
+	}
+
+	results := make(chan hashResult, 100)
+	var wg sync.WaitGroup
+
+	numWorkers := runtime.NumCPU() * 2
+	semaphore := make(chan struct{}, numWorkers)
+
 	var files []struct {
 		fnum  int64
 		fname string
@@ -576,7 +703,6 @@ func calculateMD5Hashes(db *sql.DB) error {
 		}{fnum, fname})
 	}
 
-	// Запускаем параллельные вычисления
 	for _, file := range files {
 		if !fileExists(file.fname) {
 			continue
@@ -585,28 +711,26 @@ func calculateMD5Hashes(db *sql.DB) error {
 		wg.Add(1)
 		go func(fnum int64, fname string) {
 			defer wg.Done()
-			semaphore <- struct{}{}        // Захватываем слот
-			defer func() { <-semaphore }() // Освобождаем слот
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
-			hash, err := md5File(fname)
-			results <- md5Result{fnum: fnum, hash: hash, err: err}
+			fullHash, err := fullXXH3File(fname)
+			results <- hashResult{fnum: fnum, fullHash: fullHash, err: err}
 		}(file.fnum, file.fname)
 	}
 
-	// Закрываем канал после завершения всех горутин
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Обновляем базу данных пакетами
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare("UPDATE curfiles SET md5 = ? WHERE fnum = ?")
+	stmt, err := tx.Prepare("UPDATE curfiles SET full_hash = ? WHERE fnum = ?")
 	if err != nil {
 		return err
 	}
@@ -615,17 +739,17 @@ func calculateMD5Hashes(db *sql.DB) error {
 	batchCount := 0
 	for result := range results {
 		if result.err != nil {
-			fmt.Printf("Ошибка вычисления MD5: %v\n", result.err)
+			fmt.Printf("Ошибка вычисления полного хеша: %v\n", result.err)
 			continue
 		}
 
-		if _, err := stmt.Exec(result.hash, result.fnum); err != nil {
-			fmt.Printf("Ошибка обновления MD5: %v\n", err)
+		if _, err := stmt.Exec(result.fullHash, result.fnum); err != nil {
+			fmt.Printf("Ошибка обновления полного хеша: %v\n", err)
 			continue
 		}
 
 		batchCount++
-		if batchCount >= 100 { // Коммитим каждые 100 обновлений
+		if batchCount >= 100 {
 			if err := tx.Commit(); err != nil {
 				return err
 			}
@@ -633,7 +757,7 @@ func calculateMD5Hashes(db *sql.DB) error {
 			if err != nil {
 				return err
 			}
-			stmt, err = tx.Prepare("UPDATE curfiles SET md5 = ? WHERE fnum = ?")
+			stmt, err = tx.Prepare("UPDATE curfiles SET full_hash = ? WHERE fnum = ?")
 			if err != nil {
 				return err
 			}
@@ -644,18 +768,18 @@ func calculateMD5Hashes(db *sql.DB) error {
 	return tx.Commit()
 }
 
-// findDuplicatesByMD5 оставляет только файлы с повторяющимися MD5
-func findDuplicatesByMD5(db *sql.DB) error {
-	// Получаем дубликаты по MD5
+// findDuplicatesByHash оставляет только файлы с повторяющимися full_hash
+func findDuplicatesByHash(db *sql.DB) error {
+	// Получаем дубликаты по full_hash
 	rows, err := db.Query(`
-		SELECT fnum, fname, fsize, md5 FROM curfiles 
-		WHERE md5 IS NOT NULL AND md5 IN (
-			SELECT md5 FROM curfiles 
-			WHERE md5 IS NOT NULL
-			GROUP BY md5 
+		SELECT fnum, fname, fsize, quick_hash, full_hash FROM curfiles 
+		WHERE full_hash IS NOT NULL AND full_hash IN (
+			SELECT full_hash FROM curfiles 
+			WHERE full_hash IS NOT NULL
+			GROUP BY full_hash 
 			HAVING COUNT(*) > 1
 		)
-		ORDER BY md5, fname
+		ORDER BY full_hash, fname
 	`)
 	if err != nil {
 		return err
@@ -663,10 +787,11 @@ func findDuplicatesByMD5(db *sql.DB) error {
 	defer rows.Close()
 
 	type DuplicateFile struct {
-		fnum  int64
-		fname string
-		fsize int64
-		md5   string
+		fnum      int64
+		fname     string
+		fsize     int64
+		quickHash string
+		fullHash  string
 	}
 
 	var filesToKeep []DuplicateFile
@@ -674,20 +799,20 @@ func findDuplicatesByMD5(db *sql.DB) error {
 		var fnum int64
 		var fname string
 		var fsize int64
-		var md5 string
-		if err := rows.Scan(&fnum, &fname, &fsize, &md5); err != nil {
+		var quickHash, fullHash string
+		if err := rows.Scan(&fnum, &fname, &fsize, &quickHash, &fullHash); err != nil {
 			logPrintf("Ошибка при сканировании: %v\n", err)
 			continue
 		}
-		filesToKeep = append(filesToKeep, DuplicateFile{fnum, fname, fsize, md5})
+		filesToKeep = append(filesToKeep, DuplicateFile{fnum, fname, fsize, quickHash, fullHash})
 	}
 
-	// Подсчитываем уникальные MD5
-	uniqueMD5s := make(map[string]bool)
+	// Подсчитываем уникальные full_hash
+	uniqueHashes := make(map[string]bool)
 	for _, file := range filesToKeep {
-		uniqueMD5s[file.md5] = true
+		uniqueHashes[file.fullHash] = true
 	}
-	duplicatesFound = len(filesToKeep) - len(uniqueMD5s)
+	duplicatesFound = len(filesToKeep) - len(uniqueHashes)
 
 	// Очищаем таблицу и вставляем обратно дубликаты
 	_, err = db.Exec("DELETE FROM curfiles")
@@ -695,15 +820,14 @@ func findDuplicatesByMD5(db *sql.DB) error {
 		return err
 	}
 
-	stmt, err := db.Prepare("INSERT INTO curfiles (fnum, fname, fsize, md5) VALUES (?, ?, ?, ?)")
+	stmt, err := db.Prepare("INSERT INTO curfiles (fnum, fname, fsize, quick_hash, full_hash) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, file := range filesToKeep {
-		// Передаём правильный размер файла
-		_, err = stmt.Exec(file.fnum, file.fname, file.fsize, file.md5)
+		_, err = stmt.Exec(file.fnum, file.fname, file.fsize, file.quickHash, file.fullHash)
 		if err != nil {
 			logPrintf("Ошибка добавления файла: %v\n", err)
 		}
@@ -734,9 +858,9 @@ func markAndRemoveDuplicates(db *sql.DB) error {
         SELECT fnum 
         FROM (
             SELECT fnum, fsize,
-                   ROW_NUMBER() OVER (PARTITION BY md5 ORDER BY fname) as rn
+                   ROW_NUMBER() OVER (PARTITION BY full_hash ORDER BY fname) as rn
             FROM curfiles 
-            WHERE md5 IS NOT NULL
+            WHERE full_hash IS NOT NULL
         ) ranked
         WHERE ranked.rn > 1 AND ranked.fsize >= %d
     )
@@ -792,20 +916,64 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	return nil
 }
 
-// md5File вычисляет MD5 хеш файла
-func md5File(filePath string) (string, error) {
+// quickXXH3File вычисляет быстрый хеш файла (5% начала + 5% конца)
+func quickXXH3File(filePath string, fileSize int64) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 
-	hash := md5.New()
-	if _, err := io.Copy(hash, file); err != nil {
+	hasher := xxh3.New()
+
+	// Для маленьких файлов (< 100 байт) хеш всего файла
+	if fileSize < 100 {
+		if _, err := io.Copy(hasher, file); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+	}
+
+	// Размер блока: 5% от файла, минимум 1 байт
+	blockSize := int64(float64(fileSize) * 0.05)
+	if blockSize < 1 {
+		blockSize = 1
+	}
+
+	// Читаем начало
+	startBuf := make([]byte, blockSize)
+	n, err := file.Read(startBuf)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	hasher.Write(startBuf[:n])
+
+	// Читаем конец
+	endBuf := make([]byte, blockSize)
+	file.Seek(-blockSize, io.SeekEnd)
+	n, err = file.Read(endBuf)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	hasher.Write(endBuf[:n])
+
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+// fullXXH3File вычисляет полный XXH3 хеш файла
+func fullXXH3File(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hasher := xxh3.New()
+	if _, err := io.Copy(hasher, file); err != nil {
 		return "", err
 	}
 
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
 }
 
 // fileExists проверяет существование файла
