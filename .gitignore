@@ -1,0 +1,53 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SQLite temporary files
+*.db
+*.db-shm
+*.db-wal
+
+# Lock files
+*.lock
+
+# Test data
+test_data/
+
+# Log files
+ddfgo.log
+ddfgoerr.log
+ddfgo_*.db
+
+# Generated version files (but not version.txt itself)
+version_generated.go
+
+# Only ignore cleanup.bat (keep build.bat and run_test.bat in repo)
+cleanup.bat
+
