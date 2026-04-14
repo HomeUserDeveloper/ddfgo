@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 REM Батник для тестирования ddfgo
 
 setlocal enabledelayedexpansion
