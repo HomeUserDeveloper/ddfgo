@@ -1,0 +1,20 @@
+{
+  "RT_VERSION": {
+    "#0": {
+      "0409": {
+        "Comments": "",
+        "CompanyName": "ddfgo",
+        "FileDescription": "Duplicate Finder and File Remover",
+        "FileVersion": "0.0.0.9",
+        "InternalName": "ddfgo",
+        "LegalCopyright": "Copyright (c) 2026 ddfgo contributors",
+        "LegalTrademarks": "",
+        "OriginalFilename": "ddfgo.exe",
+        "PrivateBuild": "",
+        "ProductName": "ddfgo",
+        "ProductVersion": "0.0.0.9",
+        "SpecialBuild": ""
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "FixedFileInfo": {
+    "FileVersion": {
+      "Major": 0,
+      "Minor": 0,
+      "Patch": 0,
+      "Build": 9
+    },
+    "ProductVersion": {
+      "Major": 0,
+      "Minor": 0,
+      "Patch": 0,
+      "Build": 9
+    },
+    "FileFlagsMask": "3f",
+    "FileFlags": "00",
+    "FileOS": "040004",
+    "FileType": "01",
+    "FileSubType": "00"
+  },
+  "StringFileInfo": {
+    "Comments": "Утилита для поиска и удаления дубликатов файлов",
+    "CompanyName": "ddfgo",
+    "FileDescription": "ddfgo - Duplicate Finder and Remover",
+    "FileVersion": "0.0.0.9",
+    "InternalName": "ddfgo.exe",
+    "LegalCopyright": "Copyright (c) 2026 ddfgo contributors",
+    "LegalTrademarks": "",
+    "OriginalFilename": "ddfgo.exe",
+    "PrivateBuild": "",
+    "ProductName": "ddfgo",
+    "ProductVersion": "0.0.0.9",
+    "SpecialBuild": ""
+  },
+  "VarFileInfo": {
+    "Translation": {
+      "LangID": "0409",
+      "CharsetID": "04B0"
+    }
+  },
+  "IconPath": "",
+  "ManifestPath": ""
+}
