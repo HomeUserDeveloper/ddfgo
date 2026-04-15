@@ -998,6 +998,13 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	defer rows.Close()
 
 	removedCount := 0
+	testCandidates := 0
+	testByDir := make(map[string]int)
+	testByExt := make(map[string]int)
+	testSamples := make([]string, 0, 20)
+	const testSampleLimit = 20
+	const testTopLimit = 10
+
 	for rows.Next() {
 		var fname string
 		if err := rows.Scan(&fname); err != nil {
@@ -1005,8 +1012,22 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 		}
 
 		if testMode {
-			// В режиме тестирования только логируем, не удаляем и не считаем
-			logPrintf("Файл будет удален: %s\n", fname)
+			// В режиме тестирования собираем агрегированную статистику,
+			// чтобы не засорять лог тысячами строк.
+			testCandidates++
+
+			dir := filepath.Dir(fname)
+			testByDir[dir]++
+
+			ext := strings.ToLower(filepath.Ext(fname))
+			if ext == "" {
+				ext = "<no_ext>"
+			}
+			testByExt[ext]++
+
+			if len(testSamples) < testSampleLimit {
+				testSamples = append(testSamples, fname)
+			}
 		} else {
 			// В обычном режиме удаляем файл
 			if err := os.Remove(fname); err != nil {
@@ -1014,6 +1035,61 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 			} else {
 				removedCount++
 				logPrintf("Файл удален: %s\n", fname)
+			}
+		}
+	}
+
+	if testMode {
+		logPrintf("Тестовый режим: кандидатов на удаление: %d\n", testCandidates)
+
+		type kv struct {
+			name  string
+			count int
+		}
+
+		dirStats := make([]kv, 0, len(testByDir))
+		for name, count := range testByDir {
+			dirStats = append(dirStats, kv{name: name, count: count})
+		}
+		sort.Slice(dirStats, func(i, j int) bool {
+			if dirStats[i].count == dirStats[j].count {
+				return dirStats[i].name < dirStats[j].name
+			}
+			return dirStats[i].count > dirStats[j].count
+		})
+
+		extStats := make([]kv, 0, len(testByExt))
+		for name, count := range testByExt {
+			extStats = append(extStats, kv{name: name, count: count})
+		}
+		sort.Slice(extStats, func(i, j int) bool {
+			if extStats[i].count == extStats[j].count {
+				return extStats[i].name < extStats[j].name
+			}
+			return extStats[i].count > extStats[j].count
+		})
+
+		if len(dirStats) > 0 {
+			logPrintf("Топ каталогов с дублями (до %d):\n", testTopLimit)
+			for i := 0; i < len(dirStats) && i < testTopLimit; i++ {
+				logPrintf("  [%d] %s : %d\n", i+1, dirStats[i].name, dirStats[i].count)
+			}
+		}
+
+		if len(extStats) > 0 {
+			logPrintf("Распределение по расширениям (до %d):\n", testTopLimit)
+			for i := 0; i < len(extStats) && i < testTopLimit; i++ {
+				logPrintf("  [%d] %s : %d\n", i+1, extStats[i].name, extStats[i].count)
+			}
+		}
+
+		if len(testSamples) > 0 {
+			logPrintf("Примеры файлов к удалению (до %d):\n", testSampleLimit)
+			for i, sample := range testSamples {
+				logPrintf("  [%d] %s\n", i+1, sample)
+			}
+			if testCandidates > len(testSamples) {
+				logPrintf("  ... и еще %d файлов\n", testCandidates-len(testSamples))
 			}
 		}
 	}

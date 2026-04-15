@@ -71,6 +71,20 @@ CPU профиль:           cpu_large_p2.prof
 - Экономия времени:    ~118.5 сек на прогон 141.8 GB
 - Основной выигрыш:    уменьшение I/O thrashing на этапе full hash
 
+ПРОГОН ПОСЛЕ АГРЕГИРОВАНИЯ TEST-ЛОГА:
+Время работы:          1m57.189s
+Эффективная пропускная способность: ~1.21 GB/s
+Quick hash воркеры:    16
+Full hash воркеры:     3
+CPU профиль:           cpu_large_agg.prof
+Профиль памяти:        mem_large_agg.prof
+
+Эффект агрегированного логирования (поверх Priority 2):
+- Ускорение относительно Priority 2: ~3.3%
+- Экономия времени:    ~4.0 сек на прогон 141.8 GB
+- Количество строк по кандидатам: с 912 строк до 20 строк + summary
+- Наибольший эффект:   снижение нагрузки на консоль и лог в режиме -test
+
 Состав датасета:
   01_small_50KB   100 ориг × 5 копий =   600 файлов    30 MB
   02_small_200KB   50 ориг × 4 копии =   250 файлов    50 MB
@@ -89,6 +103,10 @@ CPU профиль:           cpu_large_p2.prof
 Команда после Priority 2:
    .\ddfgo.exe -dir "d:\ddfgo_largetest" -test -clean -all
       -cpuprofile cpu_large_p2.prof -memprofile mem_large_p2.prof
+
+Команда после агрегирования test-лога:
+   .\ddfgo.exe -dir "d:\ddfgo_largetest" -test -clean -all
+      -cpuprofile cpu_large_agg.prof -memprofile mem_large_agg.prof
 
 Вывод: программа корректно обработала 141.8 GB и нашла ВСЕ 912 дубликатов.
    Priority 2 дал реальный выигрыш на большом наборе данных: почти 2x быстрее
