@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,10 +65,16 @@ var (
 	removeAllFiles  bool // флаг -all для удаления всех дубликатов, включая маленькие файлы
 	removeEmptyDirs bool // флаг -dir0 для удаления пустых каталогов
 	extensionAll    bool // флаг -ext-all для обработки файлов со всеми расширениями
+	cpuProfilePath  string
+	memProfilePath  string
 	logOutput       *os.File
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() (exitCode int) {
 	var targetDir string = os.Getenv("DDF_DIR")
 	if targetDir == "" {
 		targetDir = "E:\\SortDir"
@@ -86,17 +93,19 @@ func main() {
 	flag.BoolVar(&showHelp, "h", false, "Показать справку (сокращенно)")
 	flag.BoolVar(&showVersion, "version", false, "Показать номер версии")
 	flag.BoolVar(&showVersion, "v", false, "Показать номер версии (сокращенно)")
+	flag.StringVar(&cpuProfilePath, "cpuprofile", "", "Сохранить CPU профиль в файл")
+	flag.StringVar(&memProfilePath, "memprofile", "", "Сохранить профиль памяти в файл")
 	flag.Parse()
 
 	// Обработка флагов справки и версии
 	if showHelp || (len(os.Args) == 1) {
 		printHelp()
-		os.Exit(0)
+		return 0
 	}
 
 	if showVersion {
 		fmt.Printf("ddfgo версия: %s\n", Version)
-		os.Exit(0)
+		return 0
 	}
 
 	// Инициализируем логирование если включен тестовый режим
@@ -112,7 +121,7 @@ func main() {
 		logOutput, err = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
 		if err != nil {
 			fmt.Printf("Ошибка открытия лог файла: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		defer logOutput.Close()
 
@@ -130,7 +139,7 @@ func main() {
 		msg := "Директория не найдена или не указана"
 		logError(msg)
 		logPrintf("Ошибка: %s\n", msg)
-		os.Exit(1)
+		return 1
 	}
 
 	// Проверка MUTEX - предотвращение одновременного запуска
@@ -140,14 +149,66 @@ func main() {
 		msg := "Другой экземпляр уже запущен"
 		logError(msg)
 		logPrintf("Ошибка: %s\n", msg)
-		os.Exit(1)
+		return 1
 	}
 	defer releaseLock(lockFile, lockHandle)
 
-	// Выполняем основную логику
-	exitCode := runApp(targetDir, lockFile)
+	if cpuProfilePath != "" {
+		cpuFile, err := startCPUProfiling(cpuProfilePath)
+		if err != nil {
+			logError("Ошибка запуска CPU профилирования: %v", err)
+			logPrintf("Ошибка запуска CPU профилирования: %v\n", err)
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			cpuFile.Close()
+			logPrintf("CPU профиль сохранен: %s\n", cpuProfilePath)
+		}()
+	}
 
-	os.Exit(exitCode)
+	if memProfilePath != "" {
+		defer func() {
+			if err := writeMemoryProfile(memProfilePath); err != nil {
+				logError("Ошибка сохранения профиля памяти: %v", err)
+				logPrintf("Ошибка сохранения профиля памяти: %v\n", err)
+				if exitCode == 0 {
+					exitCode = 1
+				}
+				return
+			}
+			logPrintf("Профиль памяти сохранен: %s\n", memProfilePath)
+		}()
+	}
+
+	// Выполняем основную логику
+	exitCode = runApp(targetDir, lockFile)
+	return exitCode
+}
+
+func startCPUProfiling(path string) (*os.File, error) {
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := pprof.StartCPUProfile(file); err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	return file, nil
+}
+
+func writeMemoryProfile(path string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	runtime.GC()
+	return pprof.WriteHeapProfile(file)
 }
 
 // printHelp выводит справку по использованию программы
@@ -195,6 +256,14 @@ func printHelp() {
 	fmt.Println("    По умолчанию исключаются: .exe, .dll, .lib")
 	fmt.Println("    (эти файлы могут быть заблокированы Windows Defender при обычных правах)")
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -ext-all")
+	fmt.Println()
+	fmt.Println("  -cpuprofile \"файл\"")
+	fmt.Println("    Сохранить CPU профиль выполнения в указанный файл")
+	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -test -cpuprofile cpu.prof")
+	fmt.Println()
+	fmt.Println("  -memprofile \"файл\"")
+	fmt.Println("    Сохранить профиль памяти (heap) в указанный файл")
+	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -test -memprofile mem.prof")
 	fmt.Println()
 	fmt.Println("ИНФОРМАЦИОННЫЕ ПАРАМЕТРЫ:")
 	fmt.Println()

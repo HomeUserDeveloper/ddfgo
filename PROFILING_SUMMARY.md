@@ -7,6 +7,39 @@
 ║                                                                            ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 
+## Обновление результатов (15 апреля 2026, ветка test)
+
+Выполнено после добавления встроенных флагов профилирования в приложение:
+
+- `-cpuprofile "файл"` - CPU профиль приложения
+- `-memprofile "файл"` - профиль памяти приложения
+
+Полный тестовый прогон:
+
+1. `go test ./...`
+2. Набор benchmark-тестов (`Benchmark*`) с `-benchmem`
+3. Реальный прогон приложения:
+   `go run . -dir "d:\proj\ddfgo-test\test_duplicates" -test -clean -all -cpuprofile app_cpu.prof -memprofile app_mem.prof`
+
+Результаты benchmark (Go 1.22, windows/amd64, Intel i3-1125G4):
+
+| Бенчмарк | Результат |
+|---|---|
+| BenchmarkQuickHash | 653783 ns/op, 1164984 B/op, 102 allocs/op |
+| BenchmarkFullHash | 2478036 ns/op, 346084 B/op, 100 allocs/op |
+| BenchmarkDatabaseOperations | 157391833 ns/op, 220752 B/op, 9928 allocs/op |
+| BenchmarkScanDirectory | 60327211 ns/op, 687854 B/op, 12834 allocs/op |
+| BenchmarkFindDuplicatesParallel | 1312659700 ns/op, 59351504 B/op, 61764 allocs/op |
+| BenchmarkMemoryUsage | 1457428200 ns/op, 7492128 B/op, 174002 allocs/op |
+
+Результаты прогона приложения на `test_duplicates`:
+
+- Файлов обработано: 26
+- Найдено дубликатов: 23
+- Файлов удалено: 0 (режим `-test`)
+- Время работы: 74.8678 ms
+- Сформированы профили: `app_cpu.prof`, `app_mem.prof`
+
 📋 ОСНОВНАЯ ИНФОРМАЦИЯ
 ════════════════════════════════════════════════════════════════════════════
 
