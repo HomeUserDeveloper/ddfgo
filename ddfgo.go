@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/zeebo/xxh3"
@@ -49,7 +50,7 @@ var expandToSkip = map[string]bool{
 }
 
 // Version встраивается при компиляции через ldflags
-var Version = "000.000.000.008"
+var Version = "000.000.000.0009"
 
 var (
 	filesProcessed  int
@@ -145,6 +146,7 @@ func main() {
 
 	// Выполняем основную логику
 	exitCode := runApp(targetDir, lockFile)
+
 	os.Exit(exitCode)
 }
 
@@ -168,8 +170,8 @@ func printHelp() {
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Downloads\"")
 	fmt.Println()
 	fmt.Println("  -test")
-	fmt.Println("    Режим тестирования (логирование результатов)")
-	fmt.Println("    Все результаты будут записаны в файл ddfgo.log")
+	fmt.Println("    Тестовый режим: файлы НЕ удаляются, результаты записываются в ddfgo.log")
+	fmt.Println("    Используйте для проверки до реального удаления дубликатов")
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Photos\" -test")
 	fmt.Println()
 	fmt.Println("  -clean")
@@ -571,9 +573,6 @@ func calculateQuickHashes(db *sql.DB) error {
 	results := make(chan hashResult, 100)
 	var wg sync.WaitGroup
 
-	numWorkers := runtime.NumCPU() * 2
-	semaphore := make(chan struct{}, numWorkers)
-
 	var files []struct {
 		fnum  int64
 		fname string
@@ -592,6 +591,11 @@ func calculateQuickHashes(db *sql.DB) error {
 			fsize int64
 		}{fnum, fname, fsize})
 	}
+
+	// Используем адаптивное количество воркеров
+	numWorkers := calculateOptimalWorkerCount(int64(len(files)))
+	semaphore := make(chan struct{}, numWorkers)
+	logPrintf("Вычисление быстрых хешей: использование %d воркеров для %d файлов\n", numWorkers, len(files))
 
 	for _, file := range files {
 		if !fileExists(file.fname) {
@@ -684,9 +688,6 @@ func calculateFullHashesForDuplicates(db *sql.DB) error {
 	results := make(chan hashResult, 100)
 	var wg sync.WaitGroup
 
-	numWorkers := runtime.NumCPU() * 2
-	semaphore := make(chan struct{}, numWorkers)
-
 	var files []struct {
 		fnum  int64
 		fname string
@@ -702,6 +703,11 @@ func calculateFullHashesForDuplicates(db *sql.DB) error {
 			fname string
 		}{fnum, fname})
 	}
+
+	// Для full hash используем отдельную стратегию, чтобы не упираться в 1 воркер.
+	numWorkers := calculateFullHashWorkerCount(int64(len(files)))
+	semaphore := make(chan struct{}, numWorkers)
+	logPrintf("Вычисление полных хешей: использование %d воркеров для %d файлов\n", numWorkers, len(files))
 
 	for _, file := range files {
 		if !fileExists(file.fname) {
@@ -770,67 +776,64 @@ func calculateFullHashesForDuplicates(db *sql.DB) error {
 
 // findDuplicatesByHash оставляет только файлы с повторяющимися full_hash
 func findDuplicatesByHash(db *sql.DB) error {
-	// Получаем дубликаты по full_hash
-	rows, err := db.Query(`
-		SELECT fnum, fname, fsize, quick_hash, full_hash FROM curfiles 
-		WHERE full_hash IS NOT NULL AND full_hash IN (
-			SELECT full_hash FROM curfiles 
+	var dupGroupCount int64
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM (
+			SELECT full_hash
+			FROM curfiles
 			WHERE full_hash IS NOT NULL
-			GROUP BY full_hash 
+			GROUP BY full_hash
 			HAVING COUNT(*) > 1
 		)
-		ORDER BY full_hash, fname
+	`).Scan(&dupGroupCount)
+	if err != nil {
+		return err
+	}
+
+	// Fast path: если групп дублей нет, очищаем таблицу одним запросом.
+	if dupGroupCount == 0 {
+		duplicatesFound = 0
+		_, err = db.Exec("DELETE FROM curfiles")
+		return err
+	}
+
+	// Потоковая SQL-обработка: без загрузки всех дубликатов в память Go.
+	if _, err := db.Exec(`
+		CREATE TEMPORARY TABLE temp_dup_hashes AS
+		SELECT full_hash
+		FROM curfiles
+		WHERE full_hash IS NOT NULL
+		GROUP BY full_hash
+		HAVING COUNT(*) > 1
+	`); err != nil {
+		return err
+	}
+	defer db.Exec("DROP TABLE IF EXISTS temp_dup_hashes")
+
+	var totalDupRows int64
+	err = db.QueryRow(`
+		SELECT COALESCE(SUM(cnt - 1), 0)
+		FROM (
+			SELECT COUNT(*) AS cnt
+			FROM curfiles
+			WHERE full_hash IN (SELECT full_hash FROM temp_dup_hashes)
+			GROUP BY full_hash
+		)
+	`).Scan(&totalDupRows)
+	if err != nil {
+		return err
+	}
+	duplicatesFound = int(totalDupRows)
+
+	// Оставляем в таблице только группы с повторяющимся full_hash.
+	_, err = db.Exec(`
+		DELETE FROM curfiles
+		WHERE full_hash IS NULL
+		   OR full_hash NOT IN (SELECT full_hash FROM temp_dup_hashes)
 	`)
 	if err != nil {
 		return err
-	}
-	defer rows.Close()
-
-	type DuplicateFile struct {
-		fnum      int64
-		fname     string
-		fsize     int64
-		quickHash string
-		fullHash  string
-	}
-
-	var filesToKeep []DuplicateFile
-	for rows.Next() {
-		var fnum int64
-		var fname string
-		var fsize int64
-		var quickHash, fullHash string
-		if err := rows.Scan(&fnum, &fname, &fsize, &quickHash, &fullHash); err != nil {
-			logPrintf("Ошибка при сканировании: %v\n", err)
-			continue
-		}
-		filesToKeep = append(filesToKeep, DuplicateFile{fnum, fname, fsize, quickHash, fullHash})
-	}
-
-	// Подсчитываем уникальные full_hash
-	uniqueHashes := make(map[string]bool)
-	for _, file := range filesToKeep {
-		uniqueHashes[file.fullHash] = true
-	}
-	duplicatesFound = len(filesToKeep) - len(uniqueHashes)
-
-	// Очищаем таблицу и вставляем обратно дубликаты
-	_, err = db.Exec("DELETE FROM curfiles")
-	if err != nil {
-		return err
-	}
-
-	stmt, err := db.Prepare("INSERT INTO curfiles (fnum, fname, fsize, quick_hash, full_hash) VALUES (?, ?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for _, file := range filesToKeep {
-		_, err = stmt.Exec(file.fnum, file.fname, file.fsize, file.quickHash, file.fullHash)
-		if err != nil {
-			logPrintf("Ошибка добавления файла: %v\n", err)
-		}
 	}
 
 	return nil
@@ -916,7 +919,119 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	return nil
 }
 
-// quickXXH3File вычисляет быстрый хеш файла (5% начала + 5% конца)
+// calculateOptimalWorkerCount определяет оптимальное количество воркеров
+// на основе количества файлов для обработки
+func calculateOptimalWorkerCount(totalFiles int64) int {
+	cpuCount := runtime.NumCPU()
+
+	// Для большых количеств файлов используем разные стратегии
+	switch {
+	// Мало файлов - не нужно много горутин (I/O bound)
+	case totalFiles < 100:
+		return 1
+
+	// Небольшое кол-во - стандартное
+	case totalFiles < 1000:
+		return cpuCount
+
+	// Среднее кол-во - CPU + I/O bound
+	case totalFiles < 100000:
+		return cpuCount * 2
+
+	// Большое кол-во - I/O bound, нужно много воркеров
+	case totalFiles < 1000000:
+		return cpuCount * 4
+
+	// Огромное кол-во - максимум воркеров при ограничении памяти
+	default:
+		maxWorkers := cpuCount * 8
+		if maxWorkers > 256 {
+			maxWorkers = 256 // Мягкое ограничение
+		}
+		return maxWorkers
+	}
+}
+
+// calculateFullHashWorkerCount выбирает количество воркеров для этапа полного хеширования.
+// Полный хеш более CPU-heavy, поэтому для малых партий не опускаемся до 1 воркера.
+func calculateFullHashWorkerCount(totalFiles int64) int {
+	if totalFiles <= 0 {
+		return 1
+	}
+
+	cpuCount := runtime.NumCPU()
+	maxWorkers := cpuCount * 4
+	if maxWorkers > 256 {
+		maxWorkers = 256
+	}
+
+	workers := cpuCount
+	if workers < 2 && totalFiles > 1 {
+		workers = 2
+	}
+
+	if totalFiles < int64(workers) {
+		workers = int(totalFiles)
+		if workers < 1 {
+			workers = 1
+		}
+	}
+
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
+
+	return workers
+}
+
+// calculateQuickHashBlockSize вычисляет оптимальный размер блока для быстрого хеша
+// Адаптируется к размеру файла для баланса между скоростью и точностью
+func calculateQuickHashBlockSize(fileSize int64) int64 {
+	const minBlockSize = 1 * 1024             // 1 KB - минимум
+	const maxBlockSize = 10 * 1024 * 1024     // 10 MB - максимум
+	const maxMemoryPerFile = 20 * 1024 * 1024 // 20 MB на файл
+
+	var blockSize int64
+
+	switch {
+	// Для очень маленьких файлов - весь файл
+	case fileSize < 100*1024:
+		blockSize = fileSize
+
+	// Для маленьких файлов (100KB - 1MB) - 10%
+	case fileSize < 1024*1024:
+		blockSize = fileSize / 10
+
+	// Для средних файлов (1MB - 100MB) - 5%
+	case fileSize < 100*1024*1024:
+		blockSize = fileSize / 20
+
+	// Для больших файлов (100MB - 1GB) - 2%
+	case fileSize < 1024*1024*1024:
+		blockSize = fileSize / 50
+
+	// Для очень больших файлов (> 1GB) - 1%
+	case fileSize < 10*1024*1024*1024:
+		blockSize = fileSize / 100
+
+	// Для гигантских файлов (> 10GB) - ограничиваем память
+	default:
+		blockSize = maxMemoryPerFile / 2 // 10MB на блок
+	}
+
+	// Применяем минимум и максимум
+	if blockSize < minBlockSize {
+		blockSize = minBlockSize
+	}
+	if blockSize > maxBlockSize {
+		blockSize = maxBlockSize
+	}
+
+	return blockSize
+}
+
+// quickXXH3File вычисляет быстрый хеш файла (адаптивный размер)
+// Использует calculateQuickHashBlockSize для оптимизации в зависимости от размера файла
 func quickXXH3File(filePath string, fileSize int64) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -926,19 +1041,16 @@ func quickXXH3File(filePath string, fileSize int64) (string, error) {
 
 	hasher := xxh3.New()
 
-	// Для маленьких файлов (< 100 байт) хеш всего файла
-	if fileSize < 100 {
+	// Для маленьких файлов (< 1KB) хеш всего файла
+	if fileSize < 1024 {
 		if _, err := io.Copy(hasher, file); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("%x", hasher.Sum(nil)), nil
 	}
 
-	// Размер блока: 5% от файла, минимум 1 байт
-	blockSize := int64(float64(fileSize) * 0.05)
-	if blockSize < 1 {
-		blockSize = 1
-	}
+	// Вычисляем оптимальный размер блока
+	blockSize := calculateQuickHashBlockSize(fileSize)
 
 	// Читаем начало
 	startBuf := make([]byte, blockSize)
@@ -948,7 +1060,12 @@ func quickXXH3File(filePath string, fileSize int64) (string, error) {
 	}
 	hasher.Write(startBuf[:n])
 
-	// Читаем конец
+	// Для маленьких файлов (< 2 блока) - только начало
+	if fileSize <= blockSize*2 {
+		return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+	}
+
+	// Для больших файлов - также конец
 	endBuf := make([]byte, blockSize)
 	file.Seek(-blockSize, io.SeekEnd)
 	n, err = file.Read(endBuf)
@@ -990,17 +1107,24 @@ func dirExists(path string) bool {
 
 // isProcessAlive проверяет, живой ли процесс по PID
 func isProcessAlive(pid int) bool {
-	// На Windows попытаемся открыть процесс
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		// Процесс не найден
 		return false
 	}
 
-	// На Windows завершение сигнала всегда устанавливает err == nil, если процесс существует
-	// Мы используем сигнал Kill=0, который проверяет, может ли сигнал быть отправлен
-	err = process.Release()
-	return err == nil
+	// Signal(0) проверяет существование процесса без отправки реального сигнала.
+	err = process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "no such process") || strings.Contains(errStr, "process already finished") || strings.Contains(errStr, "not found") {
+		return false
+	}
+
+	// Для остальных ошибок (например, нехватка прав) считаем процесс существующим.
+	return true
 }
 
 // acquireLock пытается получить эксклюзивную блокировку для предотвращения одновременного запуска
