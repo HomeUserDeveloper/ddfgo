@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -68,6 +69,26 @@ var (
 	cpuProfilePath  string
 	memProfilePath  string
 	logOutput       *os.File
+)
+
+// Пулы буферов для хеш-функций — снижают нагрузку на GC и ускоряют I/O.
+var (
+	// fullHashBufPool: 4 MB буфер для io.CopyBuffer в fullXXH3File.
+	// Стандартный io.Copy использует 32 KB — в 128× меньше.
+	fullHashBufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 4*1024*1024)
+			return &buf
+		},
+	}
+	// quickHashBufPool: 10 MB буфер (= maxBlockSize) для quickXXH3File.
+	// Заменяет два make([]byte, blockSize) на каждый файл.
+	quickHashBufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 10*1024*1024)
+			return &buf
+		},
+	}
 )
 
 func main() {
@@ -534,41 +555,47 @@ func scanDirectory(root string, db *sql.DB) error {
 	batchCount := 0
 	const batchSize = 1000
 
-	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
-		if !info.IsDir() {
-			// Проверяем расширение файла
-			if !extensionAll {
-				ext := strings.ToLower(filepath.Ext(path))
-				if expandToSkip[ext] {
-					filesSkipped++
-					return nil // Пропускаем файл с исключаемым расширением
-				}
+		if d.IsDir() {
+			return nil
+		}
+
+		// Проверяем расширение файла
+		if !extensionAll {
+			ext := strings.ToLower(filepath.Ext(path))
+			if expandToSkip[ext] {
+				filesSkipped++
+				return nil
 			}
+		}
 
-			if _, err := stmt.Exec(path, info.Size()); err != nil {
-				fmt.Printf("Ошибка добавления файла %s: %v\n", path, err)
-			} else {
-				filesProcessed++
-				batchCount++
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
 
-				// Коммитим каждые 1000 записей
-				if batchCount >= batchSize {
-					if err := tx.Commit(); err != nil {
-						return err
-					}
-					tx, err = db.Begin()
-					if err != nil {
-						return err
-					}
-					stmt, err = tx.Prepare("INSERT OR IGNORE INTO curfiles (fname, fsize) VALUES (?, ?)")
-					if err != nil {
-						return err
-					}
-					batchCount = 0
+		if _, err := stmt.Exec(path, info.Size()); err != nil {
+			fmt.Printf("Ошибка добавления файла %s: %v\n", path, err)
+		} else {
+			filesProcessed++
+			batchCount++
+
+			if batchCount >= batchSize {
+				if err := tx.Commit(); err != nil {
+					return err
 				}
+				tx, err = db.Begin()
+				if err != nil {
+					return err
+				}
+				stmt, err = tx.Prepare("INSERT OR IGNORE INTO curfiles (fname, fsize) VALUES (?, ?)")
+				if err != nil {
+					return err
+				}
+				batchCount = 0
 			}
 		}
 		return nil
@@ -1112,7 +1139,9 @@ func quickXXH3File(filePath string, fileSize int64) (string, error) {
 
 	// Для маленьких файлов (< 1KB) хеш всего файла
 	if fileSize < 1024 {
-		if _, err := io.Copy(hasher, file); err != nil {
+		bufPtr := fullHashBufPool.Get().(*[]byte)
+		defer fullHashBufPool.Put(bufPtr)
+		if _, err := io.CopyBuffer(hasher, file, *bufPtr); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("%x", hasher.Sum(nil)), nil
@@ -1121,13 +1150,17 @@ func quickXXH3File(filePath string, fileSize int64) (string, error) {
 	// Вычисляем оптимальный размер блока
 	blockSize := calculateQuickHashBlockSize(fileSize)
 
+	// Буфер из пула (max 10 MB = maxBlockSize) — избегаем make на каждый файл
+	bufPtr := quickHashBufPool.Get().(*[]byte)
+	defer quickHashBufPool.Put(bufPtr)
+	buf := (*bufPtr)[:blockSize]
+
 	// Читаем начало
-	startBuf := make([]byte, blockSize)
-	n, err := file.Read(startBuf)
+	n, err := file.Read(buf)
 	if err != nil && err != io.EOF {
 		return "", err
 	}
-	hasher.Write(startBuf[:n])
+	hasher.Write(buf[:n])
 
 	// Для маленьких файлов (< 2 блока) - только начало
 	if fileSize <= blockSize*2 {
@@ -1135,13 +1168,12 @@ func quickXXH3File(filePath string, fileSize int64) (string, error) {
 	}
 
 	// Для больших файлов - также конец
-	endBuf := make([]byte, blockSize)
 	file.Seek(-blockSize, io.SeekEnd)
-	n, err = file.Read(endBuf)
+	n, err = file.Read(buf)
 	if err != nil && err != io.EOF {
 		return "", err
 	}
-	hasher.Write(endBuf[:n])
+	hasher.Write(buf[:n])
 
 	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
 }
@@ -1154,8 +1186,11 @@ func fullXXH3File(filePath string) (string, error) {
 	}
 	defer file.Close()
 
+	bufPtr := fullHashBufPool.Get().(*[]byte)
+	defer fullHashBufPool.Put(bufPtr)
+
 	hasher := xxh3.New()
-	if _, err := io.Copy(hasher, file); err != nil {
+	if _, err := io.CopyBuffer(hasher, file, *bufPtr); err != nil {
 		return "", err
 	}
 
@@ -1250,11 +1285,11 @@ func removeEmptyDirectories(root string) int {
 	// Поэтому сначала создаем список всех директорий
 	var dirs []string
 
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if info.IsDir() && path != root {
+		if d.IsDir() && path != root {
 			dirs = append(dirs, path)
 		}
 		return nil
