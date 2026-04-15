@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -194,4 +195,43 @@ func TestPerformanceAnalysis(t *testing.T) {
 	fmt.Println("2. Анализ результатов:")
 	fmt.Println("   go tool pprof -http=:8080 ddfgo.test cpu.prof")
 	fmt.Println("   go tool pprof -http=:8080 ddfgo.test mem.prof")
+}
+
+func TestCalculateQuickHashWorkerCount(t *testing.T) {
+	tinyFiles := calculateQuickHashWorkerCount(5000, 5000*512*1024)
+	largeFiles := calculateQuickHashWorkerCount(5000, 5000*2*1024*1024*1024)
+
+	if tinyFiles <= largeFiles {
+		t.Fatalf("expected more workers for tiny-file workload: tiny=%d large=%d", tinyFiles, largeFiles)
+	}
+
+	maxWorkers := runtime.NumCPU() * 8
+	if maxWorkers > 256 {
+		maxWorkers = 256
+	}
+	if tinyFiles < 1 || tinyFiles > maxWorkers {
+		t.Fatalf("quick hash workers out of bounds: %d", tinyFiles)
+	}
+}
+
+func TestCalculateFullHashWorkerCount(t *testing.T) {
+	tinyFiles := calculateFullHashWorkerCount(5000, 5000*512*1024)
+	largeFiles := calculateFullHashWorkerCount(5000, 5000*2*1024*1024*1024)
+
+	if tinyFiles <= largeFiles {
+		t.Fatalf("expected more workers for tiny-file full hash workload: tiny=%d large=%d", tinyFiles, largeFiles)
+	}
+
+	if got := calculateFullHashWorkerCount(0, 0); got != 1 {
+		t.Fatalf("expected 1 worker for empty workload, got %d", got)
+	}
+}
+
+func TestClampWorkerCount(t *testing.T) {
+	if got := clampWorkerCount(64, 3, 1, 128); got != 3 {
+		t.Fatalf("expected workers to be limited by file count, got %d", got)
+	}
+	if got := clampWorkerCount(0, 10, 1, 128); got != 1 {
+		t.Fatalf("expected minimum worker count of 1, got %d", got)
+	}
 }

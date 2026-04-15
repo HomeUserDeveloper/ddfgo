@@ -674,6 +674,7 @@ func calculateQuickHashes(db *sql.DB) error {
 		fname string
 		fsize int64
 	}
+	var totalBytes int64
 	for rows.Next() {
 		var fnum int64
 		var fname string
@@ -681,6 +682,7 @@ func calculateQuickHashes(db *sql.DB) error {
 		if err := rows.Scan(&fnum, &fname, &fsize); err != nil {
 			continue
 		}
+		totalBytes += fsize
 		files = append(files, struct {
 			fnum  int64
 			fname string
@@ -689,9 +691,9 @@ func calculateQuickHashes(db *sql.DB) error {
 	}
 
 	// Используем адаптивное количество воркеров
-	numWorkers := calculateOptimalWorkerCount(int64(len(files)))
+	numWorkers := calculateQuickHashWorkerCount(int64(len(files)), totalBytes)
 	semaphore := make(chan struct{}, numWorkers)
-	logPrintf("Вычисление быстрых хешей: использование %d воркеров для %d файлов\n", numWorkers, len(files))
+	logPrintf("Вычисление быстрых хешей: использование %d воркеров для %d файлов (%.1f GB)\n", numWorkers, len(files), float64(totalBytes)/float64(1<<30))
 
 	for _, file := range files {
 		if !fileExists(file.fname) {
@@ -762,7 +764,7 @@ func calculateQuickHashes(db *sql.DB) error {
 func calculateFullHashesForDuplicates(db *sql.DB) error {
 	// Находим файлы, где quick_hash повторяется более одного раза
 	rows, err := db.Query(`
-		SELECT fnum, fname FROM curfiles 
+		SELECT fnum, fname, fsize FROM curfiles 
 		WHERE quick_hash IS NOT NULL AND full_hash IS NULL AND quick_hash IN (
 			SELECT quick_hash FROM curfiles 
 			WHERE quick_hash IS NOT NULL
@@ -787,23 +789,28 @@ func calculateFullHashesForDuplicates(db *sql.DB) error {
 	var files []struct {
 		fnum  int64
 		fname string
+		fsize int64
 	}
+	var totalBytes int64
 	for rows.Next() {
 		var fnum int64
 		var fname string
-		if err := rows.Scan(&fnum, &fname); err != nil {
+		var fsize int64
+		if err := rows.Scan(&fnum, &fname, &fsize); err != nil {
 			continue
 		}
+		totalBytes += fsize
 		files = append(files, struct {
 			fnum  int64
 			fname string
-		}{fnum, fname})
+			fsize int64
+		}{fnum, fname, fsize})
 	}
 
-	// Для full hash используем отдельную стратегию, чтобы не упираться в 1 воркер.
-	numWorkers := calculateFullHashWorkerCount(int64(len(files)))
+	// Для full hash адаптируем параллелизм и по числу файлов, и по объёму данных.
+	numWorkers := calculateFullHashWorkerCount(int64(len(files)), totalBytes)
 	semaphore := make(chan struct{}, numWorkers)
-	logPrintf("Вычисление полных хешей: использование %d воркеров для %d файлов\n", numWorkers, len(files))
+	logPrintf("Вычисление полных хешей: использование %d воркеров для %d файлов (%.1f GB)\n", numWorkers, len(files), float64(totalBytes)/float64(1<<30))
 
 	for _, file := range files {
 		if !fileExists(file.fname) {
@@ -1015,69 +1022,103 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	return nil
 }
 
-// calculateOptimalWorkerCount определяет оптимальное количество воркеров
-// на основе количества файлов для обработки
-func calculateOptimalWorkerCount(totalFiles int64) int {
-	cpuCount := runtime.NumCPU()
-
-	// Для большых количеств файлов используем разные стратегии
-	switch {
-	// Мало файлов - не нужно много горутин (I/O bound)
-	case totalFiles < 100:
-		return 1
-
-	// Небольшое кол-во - стандартное
-	case totalFiles < 1000:
-		return cpuCount
-
-	// Среднее кол-во - CPU + I/O bound
-	case totalFiles < 100000:
-		return cpuCount * 2
-
-	// Большое кол-во - I/O bound, нужно много воркеров
-	case totalFiles < 1000000:
-		return cpuCount * 4
-
-	// Огромное кол-во - максимум воркеров при ограничении памяти
-	default:
-		maxWorkers := cpuCount * 8
-		if maxWorkers > 256 {
-			maxWorkers = 256 // Мягкое ограничение
-		}
-		return maxWorkers
-	}
-}
-
-// calculateFullHashWorkerCount выбирает количество воркеров для этапа полного хеширования.
-// Полный хеш более CPU-heavy, поэтому для малых партий не опускаемся до 1 воркера.
-func calculateFullHashWorkerCount(totalFiles int64) int {
+func clampWorkerCount(workers int, totalFiles int64, minWorkers int, maxWorkers int) int {
 	if totalFiles <= 0 {
 		return 1
 	}
-
-	cpuCount := runtime.NumCPU()
-	maxWorkers := cpuCount * 4
-	if maxWorkers > 256 {
-		maxWorkers = 256
+	if minWorkers < 1 {
+		minWorkers = 1
 	}
-
-	workers := cpuCount
-	if workers < 2 && totalFiles > 1 {
-		workers = 2
+	if maxWorkers < minWorkers {
+		maxWorkers = minWorkers
 	}
-
+	if workers < minWorkers {
+		workers = minWorkers
+	}
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
 	if totalFiles < int64(workers) {
 		workers = int(totalFiles)
 		if workers < 1 {
 			workers = 1
 		}
 	}
+	return workers
+}
 
-	if workers > maxWorkers {
-		workers = maxWorkers
+// calculateQuickHashWorkerCount выбирает число воркеров для quick hash.
+// Здесь важно не только количество файлов, но и их средний размер:
+// много мелких файлов лучше обрабатывать с более высоким параллелизмом.
+func calculateQuickHashWorkerCount(totalFiles int64, totalBytes int64) int {
+	if totalFiles <= 0 {
+		return 1
 	}
 
-	return workers
+	cpuCount := runtime.NumCPU()
+	avgFileSize := totalBytes / totalFiles
+	workers := cpuCount
+
+	switch {
+	case totalFiles < int64(cpuCount):
+		workers = int(totalFiles)
+	case avgFileSize <= 1*1024*1024:
+		workers = cpuCount * 4
+	case avgFileSize <= 64*1024*1024:
+		workers = cpuCount * 3
+	case avgFileSize <= 512*1024*1024:
+		workers = cpuCount * 2
+	default:
+		workers = cpuCount
+	}
+
+	if totalFiles >= 100000 && avgFileSize <= 64*1024*1024 {
+		workers += cpuCount
+	}
+
+	maxWorkers := cpuCount * 8
+	if maxWorkers > 256 {
+		maxWorkers = 256
+	}
+
+	return clampWorkerCount(workers, totalFiles, 1, maxWorkers)
+}
+
+// calculateFullHashWorkerCount выбирает число воркеров для полного хеширования.
+// Для больших файлов параллелизм нужно снижать, чтобы не перегружать диск.
+func calculateFullHashWorkerCount(totalFiles int64, totalBytes int64) int {
+	if totalFiles <= 0 {
+		return 1
+	}
+
+	cpuCount := runtime.NumCPU()
+	avgFileSize := totalBytes / totalFiles
+	workers := cpuCount
+
+	switch {
+	case avgFileSize <= 1*1024*1024:
+		workers = cpuCount * 2
+	case avgFileSize <= 64*1024*1024:
+		workers = cpuCount
+	case avgFileSize <= 512*1024*1024:
+		workers = cpuCount / 2
+	default:
+		workers = cpuCount / 3
+	}
+
+	if workers < 2 && totalFiles > 1 {
+		workers = 2
+	}
+	if totalBytes >= 100*1024*1024*1024 && workers > 2 {
+		workers--
+	}
+
+	maxWorkers := cpuCount * 4
+	if maxWorkers > 128 {
+		maxWorkers = 128
+	}
+
+	return clampWorkerCount(workers, totalFiles, 1, maxWorkers)
 }
 
 // calculateQuickHashBlockSize вычисляет оптимальный размер блока для быстрого хеша
