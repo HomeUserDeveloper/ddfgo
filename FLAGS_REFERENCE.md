@@ -46,6 +46,28 @@ ddfgo.exe -dir "D:\Downloads" -test -clean
 - Создает новые чистые логи
 - Используется с флагом `-test`
 
+### `-cpuprofile "файл"` - Сохранить CPU профиль
+Включает встроенное CPU-профилирование выполнения приложения
+
+```batch
+ddfgo.exe -dir "D:\Downloads" -test -cpuprofile cpu.prof
+```
+
+**Результат:**
+- Создается файл профиля CPU
+- Профиль можно открыть через `go tool pprof`
+
+### `-memprofile "файл"` - Сохранить профиль памяти
+Сохраняет heap-профиль по завершении запуска
+
+```batch
+ddfgo.exe -dir "D:\Downloads" -test -memprofile mem.prof
+```
+
+**Результат:**
+- Создается файл профиля памяти
+- Профиль можно открыть через `go tool pprof`
+
 ### `-help` или `-h` - Показать справку
 Выводит полную справку по использованию
 
@@ -144,6 +166,15 @@ ddfgo.exe -dir "E:\Videos" -test -clean
 2. Сканирует папку E:\Videos
 3. Логирует результаты в ddfgo.log
 4. НЕ удаляет файлы
+
+### Пример 7: Запуск с профилированием
+```batch
+ddfgo.exe -dir "D:\Data" -test -clean -cpuprofile cpu.prof -memprofile mem.prof
+
+REM Анализ профилей:
+go tool pprof ddfgo.exe cpu.prof
+go tool pprof ddfgo.exe mem.prof
+```
 
 ---
 
