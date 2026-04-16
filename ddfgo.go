@@ -66,6 +66,7 @@ var (
 	removeAllFiles  bool // флаг -all для удаления всех дубликатов, включая маленькие файлы
 	removeEmptyDirs bool // флаг -dir0 для удаления пустых каталогов
 	extensionAll    bool // флаг -ext-all для обработки файлов со всеми расширениями
+	keepOld         bool // флаг -keep-old для сохранения самого старого файла вместо самого нового
 	cpuProfilePath  string
 	memProfilePath  string
 	logOutput       *os.File
@@ -110,6 +111,7 @@ func run() (exitCode int) {
 	flag.BoolVar(&removeAllFiles, "all", false, "Удалять дубликаты всех размеров, включая файлы < 10KB")
 	flag.BoolVar(&removeEmptyDirs, "dir0", false, "Удалить пустые каталоги после завершения")
 	flag.BoolVar(&extensionAll, "ext-all", false, "Обрабатывать файлы со всеми расширениями (включая .exe, .dll, .lib)")
+	flag.BoolVar(&keepOld, "keep-old", false, "Сохранить самый старый файл, удалить новые дубликаты (по умолчанию: сохраняется самый новый)")
 	flag.BoolVar(&showHelp, "help", false, "Показать справку")
 	flag.BoolVar(&showHelp, "h", false, "Показать справку (сокращенно)")
 	flag.BoolVar(&showVersion, "version", false, "Показать номер версии")
@@ -278,6 +280,12 @@ func printHelp() {
 	fmt.Println("    (эти файлы могут быть заблокированы Windows Defender при обычных правах)")
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -ext-all")
 	fmt.Println()
+	fmt.Println("  -keep-old")
+	fmt.Println("    Сохранять самый СТАРЫЙ файл, удалять новые дубликаты")
+	fmt.Println("    По умолчанию: сохраняется самый НОВЫЙ файл, удаляются старые дубликаты")
+	fmt.Println("    Полезно если нужно оставить оригинал и удалить более поздние копии")
+	fmt.Println("    Пример: ddfgo -dir \"D:\\Files\" -keep-old")
+	fmt.Println()
 	fmt.Println("  -cpuprofile \"файл\"")
 	fmt.Println("    Сохранить CPU профиль выполнения в указанный файл")
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -test -cpuprofile cpu.prof")
@@ -323,10 +331,16 @@ func printHelp() {
 	fmt.Println("  7. Обработка файлов со всеми расширениями:")
 	fmt.Println("     ddfgo -dir \"D:\\Data\" -ext-all")
 	fmt.Println()
-	fmt.Println("  7. Комбинированное использование всех флагов:")
-	fmt.Println("     ddfgo -dir \"D:\\Data\" -all -dir0 -ext-all -test -clean")
+	fmt.Println("  8. Поведение по умолчанию: сохранить самый новый файл:")
+	fmt.Println("     ddfgo -dir \"D:\\Files\"")
 	fmt.Println()
-	fmt.Println("  8. Используя переменную окружения:")
+	fmt.Println("  9. Сохранение самого старого файла (обратный режим):")
+	fmt.Println("     ddfgo -dir \"D:\\Files\" -keep-old")
+	fmt.Println()
+	fmt.Println("  10. Комбинированное использование флагов:")
+	fmt.Println("      ddfgo -dir \"D:\\Data\" -all -dir0 -ext-all -keep-old -test -clean")
+	fmt.Println()
+	fmt.Println("  11. Используя переменную окружения:")
 	fmt.Println("     set DDF_DIR=D:\\MyFiles")
 	fmt.Println("     ddfgo")
 	fmt.Println()
@@ -959,6 +973,13 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	defer tx.Rollback()
 
 	// Используем оконные функции для оптимизации
+	// По умолчанию сохраняем самый новый файл (DESC).
+	// Флаг -keep-old переключает в режим сохранения самого старого (ASC).
+	sortOrder := "DESC"
+	if keepOld {
+		sortOrder = "ASC"
+	}
+
 	query := fmt.Sprintf(`
     UPDATE curfiles 
     SET fflag = 1 
@@ -966,13 +987,13 @@ func markAndRemoveDuplicates(db *sql.DB) error {
         SELECT fnum 
         FROM (
             SELECT fnum, fsize,
-                   ROW_NUMBER() OVER (PARTITION BY full_hash ORDER BY fmod ASC, fname ASC) as rn
+                   ROW_NUMBER() OVER (PARTITION BY full_hash ORDER BY fmod %s, fname %s) as rn
             FROM curfiles 
             WHERE full_hash IS NOT NULL
         ) ranked
         WHERE ranked.rn > 1 AND ranked.fsize >= %d
     )
-    `, minFileSize)
+    `, sortOrder, sortOrder, minFileSize)
 
 	result, err := tx.Exec(query)
 	if err != nil {
@@ -982,10 +1003,15 @@ func markAndRemoveDuplicates(db *sql.DB) error {
 	affected, _ := result.RowsAffected()
 
 	// Логируем информацию об исключенных файлах
+	keepMode := "самый новый"
+	if keepOld {
+		keepMode = "самый старый"
+	}
+
 	if !removeAllFiles {
-		logPrintf("Помечено для удаления: %d файлов (файлы < 10KB исключены)\n", affected)
+		logPrintf("Помечено для удаления: %d файлов (сохраняется %s, файлы < 10KB исключены)\n", affected, keepMode)
 	} else {
-		logPrintf("Помечено для удаления: %d файлов (все размеры, флаг -all)\n", affected)
+		logPrintf("Помечено для удаления: %d файлов (сохраняется %s, все размеры, флаг -all)\n", affected, keepMode)
 	}
 
 	if err := tx.Commit(); err != nil {
