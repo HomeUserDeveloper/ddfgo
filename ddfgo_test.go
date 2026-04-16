@@ -247,7 +247,7 @@ func TestKeepOldestDuplicateByMtime(t *testing.T) {
 	// Создаём три файла с одинаковым содержимым.
 	// Устанавливаем mtime вручную: oldest < middle < newest.
 	type fileSpec struct {
-		name string
+		name  string
 		mtime time.Time
 	}
 	now := time.Now()
