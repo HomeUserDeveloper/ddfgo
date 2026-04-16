@@ -52,7 +52,7 @@ var expandToSkip = map[string]bool{
 }
 
 // Version встраивается при компиляции через ldflags
-var Version = "000.000.000.0009"
+var Version = "000.000.000.0011"
 
 var (
 	filesProcessed  int

@@ -1,6 +1,6 @@
 1 VERSIONINFO
- FILEVERSION 0,0,0,9
- PRODUCTVERSION 0,0,0,9
+ FILEVERSION 0,0,0,11
+ PRODUCTVERSION 0,0,0,11
  MASK 0x3F
  FLAGS 0x00
 {
@@ -10,12 +10,12 @@
     {
       VALUE "CompanyName", "ddfgo"
       VALUE "FileDescription", "Duplicate Finder and File Remover"
-      VALUE "FileVersion", "0.0.0.9"
+      VALUE "FileVersion", "0.0.0.11"
       VALUE "InternalName", "ddfgo"
       VALUE "LegalCopyright", "Copyright (c) 2026 ddfgo contributors"
       VALUE "OriginalFilename", "ddfgo.exe"
       VALUE "ProductName", "ddfgo"
-      VALUE "ProductVersion", "0.0.0.9"
+      VALUE "ProductVersion", "0.0.0.11"
     }
   }
   BLOCK "VarFileInfo"

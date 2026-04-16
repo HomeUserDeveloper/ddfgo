@@ -8,7 +8,7 @@ ddfgo.exe -version
 ddfgo.exe -v
 ```
 
-Выведет: `ddfgo версия: 000.000.000.0009`
+Выведет: `ddfgo версия: 000.000.000.0011`
 
 ## Проблема
 
@@ -37,9 +37,9 @@ winget install MartinStorsjo.LLVM-MinGW
 # 3. Скомпилировать используя скрипт
 
 # Или использовать goversioninfo:
-goversioninfo -ver-major 0 -ver-minor 0 -ver-patch 0 -ver-build 9 ^
-  -product-ver-major 0 -product-ver-minor 0 -product-ver-patch 0 -product-ver-build 9 ^
-  -file-version "0.0.0.9" -product-version "0.0.0.9" ^
+goversioninfo -ver-major 0 -ver-minor 0 -ver-patch 0 -ver-build 11 ^
+  -product-ver-major 0 -product-ver-minor 0 -product-ver-patch 0 -product-ver-build 11 ^
+  -file-version "0.0.0.11" -product-version "0.0.0.11" ^
   -product-name "ddfgo" -company "ddfgo" ^
   -description "Duplicate Finder and File Remover" ^
   -copyright "Copyright (c) 2026 ddfgo contributors"
@@ -53,8 +53,8 @@ go build -o ddfgo.exe ddfgo.go
 
 ```cmd
 npm install -g rcedit
-rcedit ddfgo.exe --set-version-string ProductVersion "0.0.0.9"
-rcedit ddfgo.exe --set-version-string FileVersion "0.0.0.9"
+rcedit ddfgo.exe --set-version-string ProductVersion "0.0.0.11"
+rcedit ddfgo.exe --set-version-string FileVersion "0.0.0.11"
 rcedit ddfgo.exe --set-version-string ProductName "ddfgo"
 rcedit ddfgo.exe --set-version-string CompanyName "ddfgo"
 ```
