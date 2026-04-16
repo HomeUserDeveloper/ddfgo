@@ -27,7 +27,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,8 +66,6 @@ var (
 	removeEmptyDirs bool // флаг -dir0 для удаления пустых каталогов
 	extensionAll    bool // флаг -ext-all для обработки файлов со всеми расширениями
 	keepOld         bool // флаг -keep-old для сохранения самого старого файла вместо самого нового
-	cpuProfilePath  string
-	memProfilePath  string
 	logOutput       *os.File
 )
 
@@ -116,8 +113,6 @@ func run() (exitCode int) {
 	flag.BoolVar(&showHelp, "h", false, "Показать справку (сокращенно)")
 	flag.BoolVar(&showVersion, "version", false, "Показать номер версии")
 	flag.BoolVar(&showVersion, "v", false, "Показать номер версии (сокращенно)")
-	flag.StringVar(&cpuProfilePath, "cpuprofile", "", "Сохранить CPU профиль в файл")
-	flag.StringVar(&memProfilePath, "memprofile", "", "Сохранить профиль памяти в файл")
 	flag.Parse()
 
 	// Обработка флагов справки и версии
@@ -176,62 +171,9 @@ func run() (exitCode int) {
 	}
 	defer releaseLock(lockFile, lockHandle)
 
-	if cpuProfilePath != "" {
-		cpuFile, err := startCPUProfiling(cpuProfilePath)
-		if err != nil {
-			logError("Ошибка запуска CPU профилирования: %v", err)
-			logPrintf("Ошибка запуска CPU профилирования: %v\n", err)
-			return 1
-		}
-		defer func() {
-			pprof.StopCPUProfile()
-			cpuFile.Close()
-			logPrintf("CPU профиль сохранен: %s\n", cpuProfilePath)
-		}()
-	}
-
-	if memProfilePath != "" {
-		defer func() {
-			if err := writeMemoryProfile(memProfilePath); err != nil {
-				logError("Ошибка сохранения профиля памяти: %v", err)
-				logPrintf("Ошибка сохранения профиля памяти: %v\n", err)
-				if exitCode == 0 {
-					exitCode = 1
-				}
-				return
-			}
-			logPrintf("Профиль памяти сохранен: %s\n", memProfilePath)
-		}()
-	}
-
 	// Выполняем основную логику
 	exitCode = runApp(targetDir, lockFile)
 	return exitCode
-}
-
-func startCPUProfiling(path string) (*os.File, error) {
-	file, err := os.Create(path)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := pprof.StartCPUProfile(file); err != nil {
-		file.Close()
-		return nil, err
-	}
-
-	return file, nil
-}
-
-func writeMemoryProfile(path string) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	runtime.GC()
-	return pprof.WriteHeapProfile(file)
 }
 
 // printHelp выводит справку по использованию программы
@@ -285,14 +227,6 @@ func printHelp() {
 	fmt.Println("    По умолчанию: сохраняется самый НОВЫЙ файл, удаляются старые дубликаты")
 	fmt.Println("    Полезно если нужно оставить оригинал и удалить более поздние копии")
 	fmt.Println("    Пример: ddfgo -dir \"D:\\Files\" -keep-old")
-	fmt.Println()
-	fmt.Println("  -cpuprofile \"файл\"")
-	fmt.Println("    Сохранить CPU профиль выполнения в указанный файл")
-	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -test -cpuprofile cpu.prof")
-	fmt.Println()
-	fmt.Println("  -memprofile \"файл\"")
-	fmt.Println("    Сохранить профиль памяти (heap) в указанный файл")
-	fmt.Println("    Пример: ddfgo -dir \"D:\\Data\" -test -memprofile mem.prof")
 	fmt.Println()
 	fmt.Println("ИНФОРМАЦИОННЫЕ ПАРАМЕТРЫ:")
 	fmt.Println()
