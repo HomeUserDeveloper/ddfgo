@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -233,5 +234,87 @@ func TestClampWorkerCount(t *testing.T) {
 	}
 	if got := clampWorkerCount(0, 10, 1, 128); got != 1 {
 		t.Fatalf("expected minimum worker count of 1, got %d", got)
+	}
+}
+
+// TestKeepOldestDuplicateByMtime проверяет, что из группы дубликатов
+// остаётся файл с наименьшим временем модификации (самый старый).
+func TestKeepOldestDuplicateByMtime(t *testing.T) {
+	dir := t.TempDir()
+
+	content := []byte("identical content for dedup test 12345")
+
+	// Создаём три файла с одинаковым содержимым.
+	// Устанавливаем mtime вручную: oldest < middle < newest.
+	type fileSpec struct {
+		name string
+		mtime time.Time
+	}
+	now := time.Now()
+	specs := []fileSpec{
+		{"newest.txt", now},
+		{"middle.txt", now.Add(-time.Hour)},
+		{"oldest.txt", now.Add(-2 * time.Hour)},
+	}
+
+	for _, s := range specs {
+		p := filepath.Join(dir, s.name)
+		if err := os.WriteFile(p, content, 0644); err != nil {
+			t.Fatalf("write %s: %v", s.name, err)
+		}
+		if err := os.Chtimes(p, s.mtime, s.mtime); err != nil {
+			t.Fatalf("chtimes %s: %v", s.name, err)
+		}
+	}
+
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := initDatabase(db); err != nil {
+		t.Fatalf("initDatabase: %v", err)
+	}
+	if err := scanDirectory(dir, db); err != nil {
+		t.Fatalf("scanDirectory: %v", err)
+	}
+	if err := calculateHashes(db); err != nil {
+		t.Fatalf("calculateHashes: %v", err)
+	}
+	if err := findDuplicatesByHash(db); err != nil {
+		t.Fatalf("findDuplicatesByHash: %v", err)
+	}
+
+	// Устанавливаем removeAllFiles=true, чтобы размер файла не блокировал пометку.
+	origAll := removeAllFiles
+	removeAllFiles = true
+	defer func() { removeAllFiles = origAll }()
+
+	if err := markAndRemoveDuplicates(db); err != nil {
+		t.Fatalf("markAndRemoveDuplicates: %v", err)
+	}
+
+	// Проверяем: fflag=0 должен быть только у oldest.txt.
+	rows, err := db.Query("SELECT fname, fflag FROM curfiles ORDER BY fname")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var fname string
+		var fflag int
+		if err := rows.Scan(&fname, &fflag); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		base := filepath.Base(fname)
+		if base == "oldest.txt" && fflag != 0 {
+			t.Errorf("oldest.txt должен быть сохранён (fflag=0), но fflag=%d", fflag)
+		}
+		if (base == "middle.txt" || base == "newest.txt") && fflag != 1 {
+			t.Errorf("%s должен быть помечен к удалению (fflag=1), но fflag=%d", base, fflag)
+		}
 	}
 }

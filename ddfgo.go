@@ -512,6 +512,7 @@ func initDatabase(db *sql.DB) error {
         fnum INTEGER PRIMARY KEY,
         fname TEXT NOT NULL UNIQUE,
         fsize INTEGER NOT NULL,
+        fmod INTEGER NOT NULL DEFAULT 0,
         quick_hash TEXT,
         full_hash TEXT,
         fflag INTEGER DEFAULT 0
@@ -527,6 +528,7 @@ func initDatabase(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_quick_hash ON curfiles(quick_hash)",
 		"CREATE INDEX IF NOT EXISTS idx_full_hash ON curfiles(full_hash)",
 		"CREATE INDEX IF NOT EXISTS idx_fflag ON curfiles(fflag)",
+		"CREATE INDEX IF NOT EXISTS idx_fmod ON curfiles(fmod)",
 	}
 
 	for _, indexQuery := range indexes {
@@ -546,7 +548,7 @@ func scanDirectory(root string, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare("INSERT OR IGNORE INTO curfiles (fname, fsize) VALUES (?, ?)")
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO curfiles (fname, fsize, fmod) VALUES (?, ?, ?)")
 	if err != nil {
 		return err
 	}
@@ -577,7 +579,7 @@ func scanDirectory(root string, db *sql.DB) error {
 			return nil
 		}
 
-		if _, err := stmt.Exec(path, info.Size()); err != nil {
+		if _, err := stmt.Exec(path, info.Size(), info.ModTime().UnixNano()); err != nil {
 			fmt.Printf("Ошибка добавления файла %s: %v\n", path, err)
 		} else {
 			filesProcessed++
@@ -591,7 +593,7 @@ func scanDirectory(root string, db *sql.DB) error {
 				if err != nil {
 					return err
 				}
-				stmt, err = tx.Prepare("INSERT OR IGNORE INTO curfiles (fname, fsize) VALUES (?, ?)")
+				stmt, err = tx.Prepare("INSERT OR IGNORE INTO curfiles (fname, fsize, fmod) VALUES (?, ?, ?)")
 				if err != nil {
 					return err
 				}
@@ -613,7 +615,7 @@ func scanDirectory(root string, db *sql.DB) error {
 func findDuplicatesBySize(db *sql.DB) error {
 	queries := []string{
 		`CREATE TEMPORARY TABLE temp_duplicates AS
-         SELECT fnum, fname, fsize 
+         SELECT fnum, fname, fsize, fmod
          FROM curfiles 
          WHERE fsize IN (
              SELECT fsize 
@@ -622,8 +624,8 @@ func findDuplicatesBySize(db *sql.DB) error {
              HAVING COUNT(*) > 1
          )`,
 		`DELETE FROM curfiles`,
-		`INSERT INTO curfiles (fnum, fname, fsize)
-         SELECT fnum, fname, fsize FROM temp_duplicates`,
+		`INSERT INTO curfiles (fnum, fname, fsize, fmod)
+         SELECT fnum, fname, fsize, fmod FROM temp_duplicates`,
 		`DROP TABLE temp_duplicates`,
 	}
 
@@ -964,7 +966,7 @@ func markAndRemoveDuplicates(db *sql.DB) error {
         SELECT fnum 
         FROM (
             SELECT fnum, fsize,
-                   ROW_NUMBER() OVER (PARTITION BY full_hash ORDER BY fname) as rn
+                   ROW_NUMBER() OVER (PARTITION BY full_hash ORDER BY fmod ASC, fname ASC) as rn
             FROM curfiles 
             WHERE full_hash IS NOT NULL
         ) ranked
