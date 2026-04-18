@@ -292,6 +292,11 @@ func TestKeepOldestDuplicateByMtime(t *testing.T) {
 	removeAllFiles = true
 	defer func() { removeAllFiles = origAll }()
 
+	// Для этого теста проверяем режим сохранения самого старого файла.
+	origKeepOld := keepOld
+	keepOld = true
+	defer func() { keepOld = origKeepOld }()
+
 	if err := markAndRemoveDuplicates(db); err != nil {
 		t.Fatalf("markAndRemoveDuplicates: %v", err)
 	}
