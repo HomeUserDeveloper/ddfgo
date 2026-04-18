@@ -3,9 +3,11 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,14 +190,59 @@ func BenchmarkMemoryUsage(b *testing.B) {
 	}
 }
 
-// TestPerformanceAnalysis - не тест, а целевая функция для профилирования
+// TestPerformanceAnalysis выводит актуальные команды для бенчмарков и pprof.
 func TestPerformanceAnalysis(t *testing.T) {
 	fmt.Println("Рекомендуемые команды для анализа производительности:")
 	fmt.Println("1. Запуск всех бенчмарков:")
-	fmt.Println("   go test -bench=. -benchmem -cpuprofile=cpu.prof -memprofile=mem.prof")
+	fmt.Println("   go test -bench=. -benchmem")
 	fmt.Println("2. Анализ результатов:")
+	fmt.Println("   go test -c")
+	fmt.Println("   go test -bench=. -benchmem -cpuprofile=cpu.prof -memprofile=mem.prof")
 	fmt.Println("   go tool pprof -http=:8080 ddfgo.test cpu.prof")
 	fmt.Println("   go tool pprof -http=:8080 ddfgo.test mem.prof")
+}
+
+func TestHelpDoesNotMentionRemovedProfileFlags(t *testing.T) {
+	helpText := captureStdout(t, printHelp)
+
+	if strings.Contains(helpText, "-cpuprofile") {
+		t.Fatalf("help must not mention removed flag -cpuprofile")
+	}
+	if strings.Contains(helpText, "-memprofile") {
+		t.Fatalf("help must not mention removed flag -memprofile")
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+
+	os.Stdout = w
+	defer func() {
+		os.Stdout = oldStdout
+	}()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close write pipe: %v", err)
+	}
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read captured output: %v", err)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("close read pipe: %v", err)
+	}
+
+	return string(out)
 }
 
 func TestCalculateQuickHashWorkerCount(t *testing.T) {
